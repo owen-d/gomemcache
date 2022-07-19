@@ -142,6 +142,9 @@ func NewFromSelector(ss ServerSelector) *Client {
 // Client is a memcache client.
 // It is safe for unlocked use by multiple concurrent goroutines.
 type Client struct {
+	// Dialer specifies a custom dialer used to dial new connections to a server.
+	DialTimeout func(network, address string, timeout time.Duration) (net.Conn, error)
+
 	// Timeout specifies the socket read/write timeout.
 	// If zero, DefaultTimeout is used.
 	Timeout time.Duration
@@ -284,6 +287,10 @@ func (cte *ConnectTimeoutError) Error() string {
 }
 
 func (c *Client) dial(addr net.Addr) (net.Conn, error) {
+	if c.DialTimeout == nil {
+		c.DialTimeout = net.DialTimeout
+	}
+
 	nc, err := net.DialTimeout(addr.Network(), addr.String(), c.netTimeout())
 	if err == nil {
 		return nc, nil
