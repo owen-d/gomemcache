@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 
@@ -126,7 +127,16 @@ func New(server ...string) *Client {
 
 // NewFromSelector returns a new Client using the provided ServerSelector.
 func NewFromSelector(ss ServerSelector) *Client {
-	return &Client{selector: ss}
+	c := Client{selector: ss}
+
+	// TODO: make configurable
+	shards := 128
+
+	c.connMaps = make([]*connMap, 0, shards)
+	for i := 0; i < shards; i++ {
+		c.connMaps = append(c.connMaps, &connMap{})
+	}
+	return &c
 }
 
 // Client is a memcache client.
@@ -146,6 +156,10 @@ type Client struct {
 
 	selector ServerSelector
 
+	connMaps []*connMap
+}
+
+type connMap struct {
 	lk       sync.Mutex
 	freeconn map[string][]*conn
 }
@@ -200,32 +214,47 @@ func (cn *conn) condRelease(err *error) {
 	}
 }
 
+func (c *Client) cmFor(addr string) *connMap {
+	return c.connMaps[int(hash(addr))%len(c.connMaps)]
+}
+
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
-	c.lk.Lock()
-	defer c.lk.Unlock()
-	if c.freeconn == nil {
-		c.freeconn = make(map[string][]*conn)
+	cm := c.cmFor(addr.String())
+	cm.lk.Lock()
+	defer cm.lk.Unlock()
+
+	if cm.freeconn == nil {
+		cm.freeconn = make(map[string][]*conn)
 	}
-	freelist := c.freeconn[addr.String()]
+	freelist := cm.freeconn[addr.String()]
 	if len(freelist) >= c.maxIdleConns() {
 		cn.nc.Close()
 		return
 	}
-	c.freeconn[addr.String()] = append(freelist, cn)
+	cm.freeconn[addr.String()] = append(freelist, cn)
+}
+
+func hash(s string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return h.Sum32()
 }
 
 func (c *Client) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
-	c.lk.Lock()
-	defer c.lk.Unlock()
-	if c.freeconn == nil {
+	cm := c.cmFor(addr.String())
+	cm.lk.Lock()
+	defer cm.lk.Unlock()
+
+	if cm.freeconn == nil {
 		return nil, false
 	}
-	freelist, ok := c.freeconn[addr.String()]
+
+	freelist, ok := cm.freeconn[addr.String()]
 	if !ok || len(freelist) == 0 {
 		return nil, false
 	}
 	cn = freelist[len(freelist)-1]
-	c.freeconn[addr.String()] = freelist[:len(freelist)-1]
+	cm.freeconn[addr.String()] = freelist[:len(freelist)-1]
 	return cn, true
 }
 
@@ -477,7 +506,7 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 	}
 
 	var err error
-	for _ = range keyMap {
+	for range keyMap {
 		if ge := <-ch; ge != nil {
 			err = ge
 		}
